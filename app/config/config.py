@@ -239,7 +239,11 @@ def save_config():
                 f.write(serialized_config)
                 f.flush()
                 os.fsync(f.fileno())
-            os.replace(temp_path, config_file)
+            try:
+                os.replace(temp_path, config_file)
+            except OSError:
+                if os.path.exists(temp_path):
+                    shutil.copy(temp_path, config_file)
             _cfg.clear()
             _cfg.update(config_to_save)
         finally:
