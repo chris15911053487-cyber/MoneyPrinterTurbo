@@ -250,7 +250,7 @@ def generate_terms(task_id, params, video_script):
     if not video_terms:
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
-        # 无法改善“后面内容的画面提前出现”的问题。
+        # 无法改善"后面内容的画面提前出现"的问题。
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=video_script,
@@ -275,9 +275,15 @@ def generate_terms(task_id, params, video_script):
         )
         return None
 
-    # 可选的 TwelveLabs Marengo 语义重排：未启用时返回原顺序，无任何副作用。
-    # 顺序匹配模式下关键词顺序本身就是脚本叙事顺序，必须保持原样，故跳过。
-    if not params.match_materials_to_script:
+    # 逐句关键词模式下，顺序本身就是按脚本叙事排列的，跳过语义重排；
+    # 同时也不应打乱素材顺序，后续拼接自动使用 sequential 模式。
+    # TwelveLabs Marengo 重排仅适用于全局关键词模式。
+    _is_per_sentence = (
+        isinstance(video_terms, list)
+        and video_terms
+        and isinstance(video_terms[0], dict)
+    )
+    if not _is_per_sentence and not params.match_materials_to_script:
         video_terms = twelvelabs.rerank_terms_by_subject(
             video_subject=params.video_subject,
             search_terms=video_terms,
@@ -471,8 +477,13 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
-        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
+        # 检测是否为逐句关键词模式
+        _is_per_sentence = (
+            isinstance(video_terms, list)
+            and video_terms
+            and isinstance(video_terms[0], dict)
+        )
+        _use_sequential = params.match_materials_to_script or _is_per_sentence
         downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
@@ -480,12 +491,12 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             video_aspect=params.video_aspect,
             video_concat_mode=(
                 VideoConcatMode.sequential
-                if params.match_materials_to_script
+                if _use_sequential
                 else params.video_concat_mode
             ),
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
-            match_script_order=params.match_materials_to_script,
+            match_script_order=_use_sequential,
         )
         if not downloaded_videos:
             _mark_task_failed(
@@ -507,7 +518,7 @@ def generate_final_videos(
         params.bgm_type == "sonilo"
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
-    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
+    # 多视频生成默认会打散素材以增加差异；但"按文案顺序匹配素材"追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.match_materials_to_script:
         video_concat_mode = VideoConcatMode.sequential
@@ -1046,6 +1057,16 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
     # 这样可以避免 /subtitle 和 /audio 这类请求访问不存在的字段。
     if type(params.video_concat_mode) is str:
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
+
+    # 逐句关键词模式下，素材已按脚本句子顺序下载排列，必须使用顺序拼接
+    # 以保证第1句的素材出现在视频开头，第2句紧随其后，画面与文案自然对齐。
+    _is_per_sentence = (
+        isinstance(video_terms, list)
+        and video_terms
+        and isinstance(video_terms[0], dict)
+    )
+    if _is_per_sentence:
+        params.match_materials_to_script = True
 
     # 6. Generate final videos
     final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(

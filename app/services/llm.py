@@ -587,34 +587,25 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
-) -> List[str]:
+) -> List[str] | List[dict]:
     if match_script_order:
-        goal = (
-            f"Generate {amount} chronological stock-video search terms that follow "
-            "the order of topics in the video script."
-        )
-        ordering_rule = (
-            "6. keep the terms in the same order as the script narration; "
-            "earlier terms must describe earlier visual moments."
-        )
-        # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
-        # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
-        example_terms = [
-            "opening visual topic",
-            *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
-            "final visual topic",
-        ]
-        output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
-    else:
-        goal = (
-            f"Generate {amount} search terms for stock videos, depending on the "
-            "subject of a video."
-        )
-        ordering_rule = ""
-        output_example = (
-            '["search term 1", "search term 2", "search term 3",'
-            '"search term 4", "search term 5"]'
-        )
+        return _generate_terms_per_sentence(video_subject, video_script)
+    return _generate_terms_global(video_subject, video_script, amount)
+
+
+def _generate_terms_global(
+    video_subject: str,
+    video_script: str,
+    amount: int,
+) -> List[str]:
+    goal = (
+        f"Generate {amount} search terms for stock videos, depending on the "
+        "subject of a video."
+    )
+    output_example = (
+        '["search term 1", "search term 2", "search term 3",'
+        '"search term 4", "search term 5"]'
+    )
 
     prompt = f"""
 # Role: Video Search Terms Generator
@@ -628,7 +619,6 @@ def generate_terms(
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
 5. reply with english search terms only.
-{ordering_rule}
 
 ## Output Example:
 {output_example}
@@ -643,26 +633,103 @@ def generate_terms(
 Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
-    logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
+    logger.info(f"subject: {video_subject}")
 
-    search_terms = []
+    return _parse_and_retry_terms(prompt, expect_strings=True)
+
+
+def _generate_terms_per_sentence(
+    video_subject: str,
+    video_script: str,
+) -> List[dict]:
+    """
+    为脚本中的每一句话生成专属的中英双语搜索关键词。
+
+    Pexels/Pixabay 等素材库支持中文搜索，但中文单独查询易返回较少结果，
+    英文关键词覆盖面广却缺少中国场景。中英双语组合能同时利用两个语言的
+    索引优势：中文命中亚洲面孔和本土场景，英文兜底补充海外通用素材。
+    """
+    prompt = f"""
+# Role: Video Search Terms Generator
+
+## Goals:
+For each sentence in the video script, generate 2-3 bilingual (Chinese + English)
+stock-video search keywords that best match the visual meaning of that sentence.
+
+## Constrains:
+1. return ONLY a JSON array of objects, nothing else.
+2. each object has two fields: "sentence" (the original sentence text) and
+   "keywords" (a list of 2-3 bilingual search terms).
+3. each search term should combine Chinese AND English words, joined by a space,
+   for example "毕业季 graduation season" or "大学校园 university campus".
+   Chinese words describe the scene, English words ensure broader coverage.
+4. the search terms must visually describe what could appear on screen
+   during that specific sentence — people, places, actions, objects, moods.
+5. keep sentences in their original order. do not rearrange them.
+6. skip sentences that are purely rhetorical, transitional, or have no
+   visual content (like single-word lines "考研？", "考公？").
+
+## Output Example:
+[
+  {{"sentence": "春天的花海，如诗如画般展现在眼前", "keywords": ["春天花海 spring flowers field", "自然风景 nature landscape"]}},
+  {{"sentence": "万物复苏的季节里", "keywords": ["万物复苏 spring revival", "植物生长 plants growing"]}}
+]
+
+## Context:
+### Video Subject
+{video_subject}
+
+### Video Script
+{video_script}
+""".strip()
+
+    logger.info(f"subject: {video_subject}, mode: per-sentence")
+    return _parse_and_retry_terms(prompt, expect_strings=False)
+
+
+def _parse_and_retry_terms(prompt: str, expect_strings: bool):
+    """
+    解析 LLM 返回的关键词列表，支持重试和格式回退。
+
+    expect_strings=True  → 期望 List[str]，用于全局关键词模式
+    expect_strings=False → 期望 List[dict]，用于逐句关键词模式
+    """
     response = ""
     for i in range(_max_retries):
         try:
             response = _generate_response(prompt)
             if response.startswith("Error: "):
-                # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
-                # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
-                # 素材下载循环还会按字符遍历错误文案，产生无意义的外部请求。
-                # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
                 logger.error(f"failed to generate video terms: {response}")
                 return []
-            search_terms = json.loads(_strip_code_fence(response))
-            if not isinstance(search_terms, list) or not all(
-                isinstance(term, str) for term in search_terms
-            ):
-                logger.error("response is not a list of strings.")
+            parsed = json.loads(_strip_code_fence(response))
+            if not isinstance(parsed, list) or len(parsed) == 0:
+                logger.error("response is not a non-empty list.")
                 continue
+
+            if expect_strings:
+                if not all(isinstance(item, str) for item in parsed):
+                    logger.error("response is not a list of strings.")
+                    continue
+            else:
+                # 逐句模式：期望 [{"sentence": ..., "keywords": [...]}, ...]
+                if all(isinstance(item, dict) and "sentence" in item and "keywords" in item
+                       for item in parsed):
+                    logger.success(
+                        f"completed per-sentence terms: {len(parsed)} sentences"
+                    )
+                    return parsed
+                # 如果 LLM 返回了旧的字符串格式，尝试转换为新格式
+                if all(isinstance(item, str) for item in parsed):
+                    logger.warning(
+                        "LLM returned string list instead of per-sentence objects, "
+                        "falling back to global keyword mode"
+                    )
+                    return [{"sentence": "", "keywords": parsed}]
+                logger.error("response is not a list of sentence-keyword objects.")
+                continue
+
+            logger.success(f"completed: \n{parsed}")
+            return parsed
 
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
@@ -670,20 +737,23 @@ Please note that you must use English for generating video search terms; Chinese
                 match = re.search(r"\[.*]", response, re.DOTALL)
                 if match:
                     try:
-                        search_terms = json.loads(match.group())
-                    except Exception as e:
-                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
-                        # 否则后续排查搜索词为空时无法定位
-                        # 是模型格式问题还是解析逻辑问题。
-                        logger.warning(f"failed to generate video terms: {str(e)}")
+                        parsed = json.loads(match.group())
+                        if isinstance(parsed, list) and len(parsed) > 0:
+                            if expect_strings:
+                                if all(isinstance(item, str) for item in parsed):
+                                    return parsed
+                            elif all(isinstance(item, dict) for item in parsed):
+                                return parsed
+                    except Exception as parse_error:
+                        logger.warning(
+                            f"failed to parse video terms from regex match: {str(parse_error)}"
+                        )
 
-        if search_terms and len(search_terms) > 0:
-            break
         if i < _max_retries:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
-    logger.success(f"completed: \n{search_terms}")
-    return search_terms
+    logger.error("failed to generate video terms after all retries")
+    return []
 
 
 # =============================================================================

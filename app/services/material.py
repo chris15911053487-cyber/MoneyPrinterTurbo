@@ -303,7 +303,7 @@ def save_video(video_url: str, save_dir: str = "") -> str:
 
 def download_videos(
     task_id: str,
-    search_terms: List[str],
+    search_terms: List[str] | List[dict],
     source: str = "pexels",
     video_aspect: VideoAspect = VideoAspect.portrait,
     video_concat_mode: VideoConcatMode = VideoConcatMode.random,
@@ -322,6 +322,18 @@ def download_videos(
         material_directory = utils.task_dir(task_id)
     elif material_directory and not os.path.isdir(material_directory):
         material_directory = ""
+
+    # 逐句关键词模式：[{"sentence": "...", "keywords": [...]}, ...]
+    if search_terms and isinstance(search_terms[0], dict):
+        return _download_videos_per_sentence(
+            task_id=task_id,
+            sentence_terms=search_terms,
+            search_videos=search_videos,
+            video_aspect=video_aspect,
+            audio_duration=audio_duration,
+            max_clip_duration=max_clip_duration,
+            material_directory=material_directory,
+        )
 
     if match_script_order:
         return _download_videos_by_script_order(
@@ -380,6 +392,99 @@ def download_videos(
         except Exception as e:
             logger.error(f"failed to download video: {utils.to_json(item)} => {str(e)}")
     logger.success(f"downloaded {len(video_paths)} videos")
+    return video_paths
+
+
+def _download_videos_per_sentence(
+    task_id: str,
+    sentence_terms: List[dict],
+    search_videos,
+    video_aspect: VideoAspect,
+    audio_duration: float,
+    max_clip_duration: int,
+    material_directory: str,
+) -> List[str]:
+    """
+    按脚本句子顺序下载素材，每句话用其专属关键词搜索。
+
+    与全局关键词的 round-robin 下载不同，这里为每个句子单独搜索和下载，
+    保证第1句的素材排在最前面、第2句紧随其后。这样后续 sequential 拼接时，
+    画面主题会自然跟随文案内容推进。
+
+    每句话分配的视频片段数 = ceil(估算句子时长 / max_clip_duration)。
+    估算时长按 4.2 字/秒（中文正常语速）计算，最少 1 个片段。
+    """
+    logger.info(f"downloading videos per sentence: {len(sentence_terms)} sentences")
+    video_paths = []
+    downloaded_urls = set()
+    total_duration = 0.0
+
+    for sent_idx, sent_item in enumerate(sentence_terms):
+        if total_duration >= audio_duration:
+            break
+
+        keywords = sent_item.get("keywords", [])
+        if not keywords:
+            logger.warning(f"sentence {sent_idx}: no keywords, skipping")
+            continue
+
+        sentence_text = sent_item.get("sentence", "")
+        # 估算句子朗读时长（中文约 4.2 字/秒，最少 1 个片段）
+        estimated_chars = len(sentence_text) if sentence_text else 0
+        estimated_seconds = max(max_clip_duration, estimated_chars / 4.2)
+        clips_needed = max(1, int(estimated_seconds / max_clip_duration) + 1)
+
+        sentence_downloaded = 0
+        for keyword in keywords:
+            if sentence_downloaded >= clips_needed:
+                break
+
+            try:
+                video_items = search_videos(
+                    search_term=keyword,
+                    minimum_duration=max_clip_duration,
+                    video_aspect=video_aspect,
+                )
+                logger.info(
+                    f"sentence {sent_idx} keyword '{keyword}': "
+                    f"found {len(video_items)} videos"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"sentence {sent_idx} keyword '{keyword}' search failed: {str(e)}"
+                )
+                continue
+
+            for item in video_items:
+                if sentence_downloaded >= clips_needed:
+                    break
+                if item.url in downloaded_urls:
+                    continue
+
+                try:
+                    saved_video_path = save_video(
+                        video_url=item.url, save_dir=material_directory
+                    )
+                    if saved_video_path:
+                        video_paths.append(saved_video_path)
+                        downloaded_urls.add(item.url)
+                        sentence_downloaded += 1
+                        total_duration += min(max_clip_duration, item.duration)
+                except Exception as e:
+                    logger.warning(
+                        f"failed to download video for sentence {sent_idx}: {str(e)}"
+                    )
+
+        if sentence_downloaded == 0:
+            logger.warning(
+                f"sentence {sent_idx}: no videos downloaded for "
+                f"'{sentence_text[:50]}'"
+            )
+
+    logger.success(
+        f"downloaded {len(video_paths)} videos for {len(sentence_terms)} sentences, "
+        f"total estimated duration: {total_duration:.1f}s"
+    )
     return video_paths
 
 
