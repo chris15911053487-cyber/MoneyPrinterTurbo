@@ -287,6 +287,28 @@ def _format_task_subject(subject, max_length=30):
     return f"{subject[:max_length]}..."
 
 
+def _format_terms_for_display(terms) -> str:
+    """
+    将 LLM 返回的关键词转换为文本框可显示的字符串。
+
+    支持两种格式：
+    - List[str]（全局模式）：直接逗号拼接
+    - List[dict]（逐句模式）：提取所有 keywords 去重后拼接
+    """
+    if not terms or not isinstance(terms, list):
+        return ""
+    if isinstance(terms[0], dict):
+        all_keywords = []
+        seen = set()
+        for item in terms:
+            for kw in item.get("keywords", []):
+                if kw not in seen:
+                    all_keywords.append(kw)
+                    seen.add(kw)
+        return ", ".join(all_keywords)
+    return ", ".join(str(t) for t in terms)
+
+
 def _safe_load_task_script(task_path):
     script_file = os.path.join(task_path, "script.json")
     if not os.path.isfile(script_file):
@@ -2088,7 +2110,7 @@ def _render_script_settings(panel, params):
                             st.error(tr(terms))
                         else:
                             st.session_state["video_script"] = script
-                            st.session_state["video_terms"] = ", ".join(terms)
+                            st.session_state["video_terms"] = _format_terms_for_display(terms)
             params.video_script = st.text_area(
                 tr("Video Script"),
                 help=tr("Video Script Help"),
@@ -2118,7 +2140,7 @@ def _render_script_settings(panel, params):
                         if "Error: " in terms:
                             st.error(tr(terms))
                         else:
-                            st.session_state["video_terms"] = ", ".join(terms)
+                            st.session_state["video_terms"] = _format_terms_for_display(terms)
 
             params.video_terms = st.text_area(
                 tr("Video Keywords"),

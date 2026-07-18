@@ -602,10 +602,7 @@ def _generate_terms_global(
         f"Generate {amount} search terms for stock videos, depending on the "
         "subject of a video."
     )
-    output_example = (
-        '["search term 1", "search term 2", "search term 3",'
-        '"search term 4", "search term 5"]'
-    )
+    output_example = '["中文关键词 English keywords", "term2", "term3", "term4", "term5"]'
 
     prompt = f"""
 # Role: Video Search Terms Generator
@@ -615,10 +612,12 @@ def _generate_terms_global(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 1-3 words, always add the main subject of the video.
+2. each search term should consist of 2-5 words, combining Chinese AND English
+   (e.g. "毕业季 graduation season", "职场办公 office workplace").
+   Chinese helps find region-specific scenes; English ensures broader coverage.
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
-5. reply with english search terms only.
+5. always add the main subject of the video in each search term.
 
 ## Output Example:
 {output_example}
@@ -629,8 +628,6 @@ def _generate_terms_global(
 
 ### Video Script
 {video_script}
-
-Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
     logger.info(f"subject: {video_subject}")
