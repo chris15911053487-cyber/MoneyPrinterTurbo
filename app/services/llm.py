@@ -640,48 +640,147 @@ def _generate_terms_per_sentence(
     video_script: str,
 ) -> List[dict]:
     """
-    为脚本中的每一句话生成专属的中英双语搜索关键词。
+    为脚本中的每一句话（按标点断句）生成中英双语搜索关键词。
 
-    Pexels/Pixabay 等素材库支持中文搜索，但中文单独查询易返回较少结果，
-    英文关键词覆盖面广却缺少中国场景。中英双语组合能同时利用两个语言的
-    索引优势：中文命中亚洲面孔和本土场景，英文兜底补充海外通用素材。
+    使用与字幕/TTS 时间轴相同的断句方式，确保关键词数量和时间轴一一对应。
+    每行都会有关键词（包括短句），LLM 无法跳行。
     """
+    # 使用与字幕匹配相同的断句逻辑，保证行数对齐
+    from app.utils import utils as app_utils
+
+    script_lines = app_utils.split_string_by_punctuations(video_script)
+    if not script_lines:
+        return []
+
+    # 构建带编号的句子列表给 LLM
+    numbered_lines = "\n".join(
+        f"{i + 1}. {line}" for i, line in enumerate(script_lines)
+    )
+
     prompt = f"""
 # Role: Video Search Terms Generator
 
 ## Goals:
-For each sentence in the video script, generate 2-3 bilingual (Chinese + English)
-stock-video search keywords that best match the visual meaning of that sentence.
+Below is a video script split into {len(script_lines)} sentences (numbered).
+For EVERY sentence, generate 2-3 bilingual (Chinese + English) stock-video
+search keywords that best match the visual meaning of that sentence.
 
 ## Constrains:
-1. return ONLY a JSON array of objects, nothing else.
-2. each object has two fields: "sentence" (the original sentence text) and
-   "keywords" (a list of 2-3 bilingual search terms).
-3. each search term should combine Chinese AND English words, joined by a space,
-   for example "毕业季 graduation season" or "大学校园 university campus".
-   Chinese words describe the scene, English words ensure broader coverage.
-4. the search terms must visually describe what could appear on screen
-   during that specific sentence — people, places, actions, objects, moods.
-5. keep sentences in their original order. do not rearrange them.
-6. skip sentences that are purely rhetorical, transitional, or have no
-   visual content (like single-word lines "考研？", "考公？").
+1. return ONLY a JSON array with exactly {len(script_lines)} items, nothing else.
+2. each item is an array of 2-3 strings: the keywords for sentence N.
+   The position in the outer array corresponds to the sentence number.
+3. each keyword should combine Chinese AND English, e.g.
+   "毕业季 graduation season" or "大学校园 university campus".
+   Chinese describes the scene, English ensures broader coverage.
+4. keywords must visually describe what could appear on screen: people,
+   places, actions, objects, moods.
+5. for short sentences with no clear visual (e.g. "考研？"), use the
+   nearest visually meaningful neighbor's theme.
 
-## Output Example:
+## Output Format (JSON array of arrays):
 [
-  {{"sentence": "春天的花海，如诗如画般展现在眼前", "keywords": ["春天花海 spring flowers field", "自然风景 nature landscape"]}},
-  {{"sentence": "万物复苏的季节里", "keywords": ["万物复苏 spring revival", "植物生长 plants growing"]}}
+  ["keyword1 CN EN", "keyword2 CN EN"],
+  ["keyword1 CN EN", "keyword2 CN EN"],
+  ...
 ]
 
-## Context:
-### Video Subject
-{video_subject}
+## Script Sentences:
+{numbered_lines}
 
-### Video Script
-{video_script}
+## Video Subject:
+{video_subject}
 """.strip()
 
-    logger.info(f"subject: {video_subject}, mode: per-sentence")
-    return _parse_and_retry_terms(prompt, expect_strings=False)
+    logger.info(
+        f"subject: {video_subject}, mode: per-sentence, lines: {len(script_lines)}"
+    )
+
+    # 逐句模式返回 List[list[str]]，外层列表长度 = script_lines 长度
+    keyword_lists = _parse_and_retry_terms_per_sentence(prompt, len(script_lines))
+    if not keyword_lists:
+        return []
+
+    # 包装为统一格式
+    result = []
+    for i, line in enumerate(script_lines):
+        keywords = keyword_lists[i] if i < len(keyword_lists) else []
+        if not keywords:
+            keywords = _fallback_keywords(video_subject, line)
+        result.append({"sentence": line, "keywords": keywords})
+    return result
+
+
+def _fallback_keywords(video_subject: str, sentence: str) -> list[str]:
+    """LLM 未返回某句关键词时的兜底：用视频主题构造一个基本搜索词。"""
+    subject = str(video_subject or "").strip()
+    sent = str(sentence or "").strip()
+    if subject and sent:
+        return [f"{subject} {sent}"]
+    if subject:
+        return [subject]
+    return [sent] if sent else ["video background"]
+
+
+def _parse_and_retry_terms_per_sentence(
+    prompt: str, expected_count: int
+) -> list[list[str]] | None:
+    """
+    解析 LLM 返回的逐句关键词，格式为 List[List[str]]。
+
+    外层列表长度应等于 expected_count（脚本断句行数）。
+    不匹配时重试；多次失败后返回 None，由调用方用兜底关键词填充。
+    """
+    response = ""
+    for i in range(_max_retries):
+        try:
+            response = _generate_response(prompt)
+            if response.startswith("Error: "):
+                logger.error(f"failed to generate per-sentence terms: {response}")
+                return None
+            parsed = json.loads(_strip_code_fence(response))
+            if not isinstance(parsed, list) or len(parsed) == 0:
+                logger.error("response is not a non-empty list")
+                continue
+            if all(isinstance(item, list) for item in parsed):
+                if len(parsed) != expected_count:
+                    logger.warning(
+                        f"keyword count mismatch: got {len(parsed)}, "
+                        f"expected {expected_count}, retrying..."
+                    )
+                    continue
+                logger.success(f"per-sentence terms: {len(parsed)} lines")
+                return parsed
+            # 旧格式兼容：[{"sentence": ..., "keywords": [...]}, ...]
+            if all(isinstance(item, dict) for item in parsed):
+                logger.warning(
+                    "LLM returned old per-sentence format, extracting keywords"
+                )
+                result = [item.get("keywords", []) for item in parsed]
+                if len(result) != expected_count:
+                    continue
+                return result
+            logger.error("response is not a list of keyword arrays")
+            continue
+        except Exception as e:
+            logger.warning(f"failed to generate per-sentence terms: {str(e)}")
+            if response:
+                match = re.search(r"\[.*]", response, re.DOTALL)
+                if match:
+                    try:
+                        parsed = json.loads(match.group())
+                        if (
+                            isinstance(parsed, list)
+                            and len(parsed) == expected_count
+                            and all(isinstance(item, list) for item in parsed)
+                        ):
+                            return parsed
+                    except Exception:
+                        pass
+        if i < _max_retries:
+            logger.warning(
+                f"failed to generate per-sentence terms, retrying... {i + 1}"
+            )
+    return None
 
 
 def _parse_and_retry_terms(prompt: str, expect_strings: bool):

@@ -461,7 +461,9 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(task_id, params, video_terms, audio_duration):
+def get_video_materials(
+    task_id, params, video_terms, audio_duration, sentence_durations=None
+):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -484,7 +486,7 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             and isinstance(video_terms[0], dict)
         )
         _use_sequential = params.match_materials_to_script or _is_per_sentence
-        downloaded_videos = material.download_videos(
+        result = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
             source=params.video_source,
@@ -497,7 +499,22 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
             match_script_order=_use_sequential,
+            sentence_durations=sentence_durations,
         )
+        # 逐句模式返回 (flat_paths, sentence_groups) 元组
+        if _is_per_sentence and isinstance(result, tuple):
+            downloaded_videos, sentence_groups = result
+            if not downloaded_videos:
+                _mark_task_failed(
+                    task_id,
+                    "materials",
+                    f"failed to download video materials from {params.video_source}",
+                )
+                return None
+            # 将分组信息附加到返回值中供 generate_final_videos 使用
+            return {"paths": downloaded_videos, "sentence_groups": sentence_groups}
+
+        downloaded_videos = result
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,
@@ -508,12 +525,57 @@ def get_video_materials(task_id, params, video_terms, audio_duration):
         return downloaded_videos
 
 
+def _build_sentence_segments(
+    sentence_groups: list[list[str]],
+    sentence_timings: list[dict],
+) -> list[dict]:
+    """
+    将逐句素材分组和 TTS 时间轴组装为分段时间信息。
+
+    返回: [
+      {"videos": [path, ...], "duration": 2.3, "sentence": "..."},
+      ...
+    ]
+    """
+    segments = []
+    for i, (groups, timing) in enumerate(
+        zip(sentence_groups, sentence_timings)
+    ):
+        duration = max(0.1, timing.get("end", 0) - timing.get("start", 0))
+        segments.append(
+            {
+                "videos": groups if groups else [],
+                "duration": duration,
+                "sentence": timing.get("sentence", ""),
+            }
+        )
+    # 如果时间轴行数多于素材分组（边缘情况），补齐空素材
+    if len(sentence_timings) > len(sentence_groups):
+        for timing in sentence_timings[len(sentence_groups):]:
+            duration = max(0.1, timing.get("end", 0) - timing.get("start", 0))
+            segments.append(
+                {"videos": [], "duration": duration, "sentence": timing.get("sentence", "")}
+            )
+    return segments
+
+
 def generate_final_videos(
-    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
+    task_id,
+    params,
+    downloaded_videos,
+    audio_file,
+    subtitle_path,
+    audio_duration,
+    sentence_timings=None,
 ):
     final_video_paths = []
     combined_video_paths = []
     warnings = []
+    # 逐句模式：从 downloaded_videos 中提取分组信息和时间轴
+    sentence_groups = None
+    if isinstance(downloaded_videos, dict):
+        sentence_groups = downloaded_videos.get("sentence_groups")
+        downloaded_videos = downloaded_videos.get("paths", [])
     sonilo_bgm_requested = (
         params.bgm_type == "sonilo"
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
@@ -535,6 +597,16 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
+        # 逐句模式：构建精确时长的分段时间信息
+        _segments = None
+        if sentence_groups and sentence_timings:
+            _segments = _build_sentence_segments(
+                sentence_groups, sentence_timings
+            )
+            logger.info(
+                f"using sentence-level segments: {len(_segments)} segments, "
+                f"total duration: {sum(s.get('duration', 0) for s in _segments):.1f}s"
+            )
         video.combine_videos(
             combined_video_path=combined_video_path,
             video_paths=downloaded_videos,
@@ -545,6 +617,7 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
+            sentence_segments=_segments,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1020,6 +1093,31 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
         task_id, params, video_script, sub_maker, audio_file
     )
 
+    # 逐句模式下，从 TTS 数据中提取每句话的朗读时间轴
+    _is_per_sentence = (
+        isinstance(video_terms, list)
+        and video_terms
+        and isinstance(video_terms[0], dict)
+    )
+    sentence_timings = None
+    sentence_durations = None
+    if _is_per_sentence and sub_maker is not None:
+        try:
+            sentence_timings = voice.get_sentence_timings(
+                sub_maker, video_script
+            )
+            sentence_durations = [
+                max(0.1, t["end"] - t["start"]) for t in sentence_timings
+            ]
+            logger.info(
+                f"extracted {len(sentence_durations)} sentence durations "
+                f"from TTS for per-sentence matching"
+            )
+        except Exception as exc:
+            logger.warning(f"failed to extract sentence timings: {exc}")
+            sentence_timings = None
+            sentence_durations = None
+
     if stop_at == "subtitle":
         sm.state.update_task(
             task_id,
@@ -1033,7 +1131,7 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration
+        task_id, params, video_terms, audio_duration, sentence_durations
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1076,6 +1174,7 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
         audio_file,
         subtitle_path,
         audio_duration,
+        sentence_timings=sentence_timings,
     )
 
     if not final_video_paths:

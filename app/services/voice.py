@@ -1826,6 +1826,80 @@ def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
         logger.error(f"failed, error: {str(e)}")
 
 
+def get_sentence_timings(sub_maker: SubMaker, text: str) -> list[dict]:
+    """
+    从 TTS 字幕数据中提取每句话的时间轴。
+
+    返回: [
+      {"sentence": "毕业季...", "start": 0.0, "end": 2.3},
+      {"sentence": "考研？", "start": 2.3, "end": 3.1},
+      ...
+    ]
+
+    如果匹配不完整，剩余句子用估算时间填充（每句至少 0.8 秒）。
+    """
+    text = _format_text(text)
+    script_lines = utils.split_string_by_punctuations(text)
+    audio_duration_sec = _get_audio_duration_from_submaker(sub_maker)
+    audio_duration_100ns = int(audio_duration_sec * 10_000_000)
+    formatter = _build_subtitle_formatter()
+
+    if hasattr(sub_maker, "cues") and sub_maker.cues:
+        sub_items, matched_count = _build_subtitle_items_from_edge_cues(
+            sub_maker, script_lines
+        )
+    else:
+        sub_items, matched_count = _build_subtitle_items_from_legacy_submaker(
+            sub_maker, script_lines
+        )
+
+    # 填充未匹配行
+    if matched_count < len(script_lines):
+        last_end_100ns = 0
+        if sub_items:
+            try:
+                last_end_100ns = _parse_last_subtitle_end_time(sub_items)
+            except Exception:
+                last_end_100ns = 0
+        sub_items = _fill_remaining_script_lines(
+            sub_items=sub_items,
+            script_lines=script_lines,
+            sub_index=matched_count,
+            last_end_time_100ns=last_end_100ns,
+            audio_duration_100ns=max(audio_duration_100ns, last_end_100ns),
+            formatter=formatter,
+        )
+
+    # 从 SRT 片段解析时间轴
+    timings = []
+    for item in sub_items:
+        lines = item.strip().split("\n")
+        if len(lines) < 2:
+            continue
+        time_line = lines[1]
+        parts = time_line.split(" --> ")
+        if len(parts) < 2:
+            continue
+
+        def _parse_srt_time(t: str) -> float:
+            t = t.strip().replace(",", ".")
+            h, m, s = t.split(":")
+            return int(h) * 3600 + int(m) * 60 + float(s)
+
+        start_sec = _parse_srt_time(parts[0])
+        end_sec = _parse_srt_time(parts[1])
+        text_line = "\n".join(lines[2:]).strip() if len(lines) > 2 else ""
+        timings.append(
+            {"sentence": text_line, "start": start_sec, "end": end_sec}
+        )
+
+    logger.info(
+        f"extracted {len(timings)} sentence timings, "
+        f"total audio: {audio_duration_sec:.2f}s"
+    )
+    return timings
+
+
 def _get_audio_duration_from_submaker(sub_maker: SubMaker):
     """
     获取音频时长

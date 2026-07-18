@@ -310,6 +310,7 @@ def download_videos(
     audio_duration: float = 0.0,
     max_clip_duration: int = 5,
     match_script_order: bool = False,
+    sentence_durations: list[float] | None = None,
 ) -> List[str]:
     search_videos = search_videos_pexels
     if source == "pixabay":
@@ -324,6 +325,7 @@ def download_videos(
         material_directory = ""
 
     # 逐句关键词模式：[{"sentence": "...", "keywords": [...]}, ...]
+    # 返回 (flat_paths, sentence_groups) 元组，供上层做精确分段对齐
     if search_terms and isinstance(search_terms[0], dict):
         return _download_videos_per_sentence(
             task_id=task_id,
@@ -333,6 +335,7 @@ def download_videos(
             audio_duration=audio_duration,
             max_clip_duration=max_clip_duration,
             material_directory=material_directory,
+            sentence_durations=sentence_durations,
         )
 
     if match_script_order:
@@ -403,37 +406,49 @@ def _download_videos_per_sentence(
     audio_duration: float,
     max_clip_duration: int,
     material_directory: str,
+    sentence_durations: list[float] | None = None,
 ) -> List[str]:
     """
     按脚本句子顺序下载素材，每句话用其专属关键词搜索。
 
-    与全局关键词的 round-robin 下载不同，这里为每个句子单独搜索和下载，
-    保证第1句的素材排在最前面、第2句紧随其后。这样后续 sequential 拼接时，
-    画面主题会自然跟随文案内容推进。
+    当提供 sentence_durations 时，用 TTS 实际朗读时长计算所需片段数，
+    确保素材时长和字幕时间轴精确对齐。
 
-    每句话分配的视频片段数 = ceil(估算句子时长 / max_clip_duration)。
-    估算时长按 4.2 字/秒（中文正常语速）计算，最少 1 个片段。
+    返回: (flat_paths, sentence_groups)
+    - flat_paths: 全部视频路径的扁平列表（兼容旧接口）
+    - sentence_groups: 按句子分组的视频路径列表
     """
     logger.info(f"downloading videos per sentence: {len(sentence_terms)} sentences")
-    video_paths = []
+    flat_paths = []
+    sentence_groups = []
     downloaded_urls = set()
     total_duration = 0.0
 
     for sent_idx, sent_item in enumerate(sentence_terms):
-        if total_duration >= audio_duration:
-            break
+        if total_duration >= audio_duration and audio_duration > 0:
+            sentence_groups.append([])
+            continue
 
         keywords = sent_item.get("keywords", [])
         if not keywords:
             logger.warning(f"sentence {sent_idx}: no keywords, skipping")
+            sentence_groups.append([])
             continue
 
-        sentence_text = sent_item.get("sentence", "")
-        # 估算句子朗读时长（中文约 4.2 字/秒，最少 1 个片段）
-        estimated_chars = len(sentence_text) if sentence_text else 0
-        estimated_seconds = max(max_clip_duration, estimated_chars / 4.2)
-        clips_needed = max(1, int(estimated_seconds / max_clip_duration) + 1)
+        # 使用 TTS 实际时长（优先）或按字数估算
+        if sentence_durations and sent_idx < len(sentence_durations):
+            sentence_sec = sentence_durations[sent_idx]
+        else:
+            sentence_text = sent_item.get("sentence", "")
+            sentence_sec = max(max_clip_duration, len(sentence_text) / 4.2)
 
+        clips_needed = max(1, int(sentence_sec / max_clip_duration) + 1)
+        logger.debug(
+            f"sentence {sent_idx}: duration={sentence_sec:.2f}s, "
+            f"clips_needed={clips_needed}"
+        )
+
+        sent_paths = []
         sentence_downloaded = 0
         for keyword in keywords:
             if sentence_downloaded >= clips_needed:
@@ -466,7 +481,8 @@ def _download_videos_per_sentence(
                         video_url=item.url, save_dir=material_directory
                     )
                     if saved_video_path:
-                        video_paths.append(saved_video_path)
+                        flat_paths.append(saved_video_path)
+                        sent_paths.append(saved_video_path)
                         downloaded_urls.add(item.url)
                         sentence_downloaded += 1
                         total_duration += min(max_clip_duration, item.duration)
@@ -475,17 +491,18 @@ def _download_videos_per_sentence(
                         f"failed to download video for sentence {sent_idx}: {str(e)}"
                     )
 
+        sentence_groups.append(sent_paths)
         if sentence_downloaded == 0:
             logger.warning(
                 f"sentence {sent_idx}: no videos downloaded for "
-                f"'{sentence_text[:50]}'"
+                f"'{str(sent_item.get('sentence', ''))[:50]}'"
             )
 
     logger.success(
-        f"downloaded {len(video_paths)} videos for {len(sentence_terms)} sentences, "
+        f"downloaded {len(flat_paths)} videos for {len(sentence_terms)} sentences, "
         f"total estimated duration: {total_duration:.1f}s"
     )
-    return video_paths
+    return flat_paths, sentence_groups
 
 
 def _download_videos_by_script_order(
