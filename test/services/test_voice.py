@@ -794,7 +794,7 @@ class TestVoiceService(unittest.TestCase):
             )
         sub_maker = SimpleNamespace(cues=cues)
 
-        sub_items = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+        sub_items, matched_count = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
 
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("1,000 years", sub_items[-1])
@@ -823,13 +823,14 @@ class TestVoiceService(unittest.TestCase):
         """
         script_lines = ["أهلاً وسهلاً بك في المدرسة"]
 
-        matched = vs._match_script_line(
+        matched_text, lines_consumed = vs._match_script_line(
             script_lines,
             "اهلا وسهلا بك في المدرسه",
             0,
         )
 
-        self.assertEqual(matched, script_lines[0])
+        self.assertEqual(matched_text, script_lines[0])
+        self.assertEqual(lines_consumed, 1)
 
     def test_edge_cue_aggregation_handles_arabic_variant_forms(self):
         """
@@ -854,7 +855,7 @@ class TestVoiceService(unittest.TestCase):
             ]
         )
 
-        sub_items = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+        sub_items, matched_count = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
 
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("أهلاً وسهلاً بك في المدرسة", sub_items[0])

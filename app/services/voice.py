@@ -12,7 +12,7 @@ import threading
 import time
 import unicodedata
 from datetime import datetime
-from typing import Union
+from typing import Tuple, Union
 from xml.sax.saxutils import escape, unescape
 
 import edge_tts
@@ -258,7 +258,7 @@ def is_chatterbox_voice(voice_name: str) -> bool:
 
 def is_no_voice(voice_name: str | None) -> bool:
     """
-    判断用户是否明确选择了“无配音”模式。
+    判断用户是否明确选择了"无配音"模式。
 
     这里刻意不把空字符串当成无配音：空 voice 更可能是配置损坏、旧版本
     WebUI 状态丢失或接口参数缺失。只有明确的 sentinel 才进入静音分支，
@@ -306,7 +306,7 @@ def estimate_no_voice_duration(text: str) -> float:
 
 def generate_silent_audio(duration_seconds: float, output_file: str) -> bool:
     """
-    生成 MP3 静音音频，作为“无配音”模式的时间轴占位。
+    生成 MP3 静音音频，作为"无配音"模式的时间轴占位。
 
     使用 FFmpeg 的 anullsrc 直接生成静音，比先构造临时 WAV 再转码更少中间
     文件。失败时返回 False，让上层按普通 TTS 失败路径处理并记录日志。
@@ -529,7 +529,7 @@ def populate_legacy_submaker_with_full_text(
     audio_duration_100ns = max(int(audio_duration_seconds * 10000000), 1)
 
     # Gemini / SiliconFlow 这类路径拿不到逐词边界时，仍然尽量沿用项目
-    # 原来的“按标点断句 + 按字符数比例分配时长”的策略。这样既能让
+    # 原来的"按标点断句 + 按字符数比例分配时长"的策略。这样既能让
     # create_subtitle() 匹配脚本断句，也能避免再次回退 Whisper。
     sentences = utils.split_string_by_punctuations(normalized_text)
     if not sentences:
@@ -710,7 +710,7 @@ def stream_edge_tts_chunks(
             on_chunk(chunk)
 
     # 这里显式创建独立事件循环，而不是复用外部上下文，目的是避免
-    # 在同步调用栈里遇到“当前线程没有事件循环”或跨线程复用循环的问题。
+    # 在同步调用栈里遇到"当前线程没有事件循环"或跨线程复用循环的问题。
     loop = asyncio.new_event_loop()
     try:
         if timeout_seconds:
@@ -1511,39 +1511,64 @@ def _normalize_arabic(text: str) -> str:
     return text
 
 
-def _match_script_line(script_lines: list[str], current_text: str, sub_index: int) -> str:
+def _text_matches_target(current_text: str, target_text: str) -> bool:
+    """判断累计文本是否匹配目标文本（单行或合并后的多行）。"""
+    if current_text == target_text:
+        return True
+
+    current_normalized = re.sub(r"[_\W]+", "", current_text)
+    target_normalized = re.sub(r"[_\W]+", "", target_text)
+    if current_normalized == target_normalized:
+        return True
+
+    # 阿拉伯语容错：edge-tts 返回的字母形态、变音符号或 Tatweel
+    # 可能和脚本不同。只在常规匹配失败后归一化比较。
+    current_ar = re.sub(r"[_\W]+", "", _normalize_arabic(current_text))
+    target_ar = re.sub(r"[_\W]+", "", _normalize_arabic(target_text))
+    if current_ar and current_ar == target_ar:
+        return True
+
+    return False
+
+
+# TTS 连续朗读多个简短脚本行时，逐词边界会跨越多个标点断句，导致当前累积
+# 文本永远无法和单个脚本行精确匹配。这里允许把连续最多 8 个脚本行拼接后再
+# 比较，既覆盖"考研？考公？找工作？创业？"这类密集短句，也避免不合理地
+# 把整段脚本合并成单一字幕。
+_MAX_MULTI_LINE_MERGE = 8
+
+
+def _match_script_line(script_lines: list[str], current_text: str, sub_index: int) -> tuple[str, int]:
     """
-    尝试把当前累计的字幕文本，与脚本中的某一条标准断句匹配起来。
+    尝试把当前累计的字幕文本，与脚本中的断句匹配起来。
 
-    这里复用了项目原有的“按标点拆脚本，再逐段比对”的思路：
-    1. 优先精确匹配；
-    2. 再做一次去标点和 Markdown `_` 格式符后的匹配；
-    3. 最后做一次阿拉伯语字符形态归一化匹配。
+    返回 (matched_text, lines_consumed)：
+    - matched_text：匹配到的文本（优先使用脚本文本，保证字幕显示规范）
+    - lines_consumed：本次匹配消耗的脚本行数（≥ 1）
 
-    这样可以兼容：
-    - TTS 返回里可能缺失或单独拆分的标点；
-    - 中文场景下词边界和脚本文本不完全一一对应的情况。
+    匹配策略（按优先级）：
+    1. 单行精确 / 去标点 / 阿拉伯语归一化匹配
+    2. 连续多行拼接匹配 —— 适配 TTS 把多个短句读成一段连续语音的场景
     """
     if len(script_lines) <= sub_index:
-        return ""
+        return "", 0
 
+    # 1. 单行匹配
     target_line = script_lines[sub_index]
-    if current_text == target_line:
-        return target_line.strip()
+    if _text_matches_target(current_text, target_line):
+        return target_line.strip(), 1
 
-    current_text_normalized = re.sub(r"[_\W]+", "", current_text)
-    target_line_normalized = re.sub(r"[_\W]+", "", target_line)
-    if current_text_normalized == target_line_normalized:
-        return target_line.strip()
+    # 2. 多行拼接匹配
+    end_index = min(sub_index + _MAX_MULTI_LINE_MERGE, len(script_lines))
+    for merge_count in range(2, end_index - sub_index + 1):
+        merged = "".join(script_lines[sub_index : sub_index + merge_count])
+        if _text_matches_target(current_text, merged):
+            logger.debug(
+                f"subtitle multi-line merge: {merge_count} lines at index {sub_index}"
+            )
+            return merged, merge_count
 
-    # 最后一层阿拉伯语容错：edge-tts 返回的字母形态、变音符号或 Tatweel
-    # 可能和脚本不同。只在常规匹配失败后归一化比较，非阿拉伯语文本不会受影响。
-    current_ar = re.sub(r"[_\W]+", "", _normalize_arabic(current_text))
-    target_ar = re.sub(r"[_\W]+", "", _normalize_arabic(target_line))
-    if current_ar and current_ar == target_ar:
-        return target_line.strip()
-
-    return ""
+    return "", 0
 
 
 def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
@@ -1574,14 +1599,14 @@ def _write_subtitle_items(sub_items: list[str], subtitle_file: str) -> bool:
 
 def _build_subtitle_items_from_edge_cues(
     sub_maker: SubMaker, script_lines: list[str]
-) -> list[str]:
+) -> Tuple[list[str], int]:
     """
     将 edge_tts 7.x 的细粒度 `cues` 聚合为按脚本断句的 SRT 片段。
 
     背景：
     edge_tts 7.x 的 `SubMaker.get_srt()` 更偏向逐词/逐短语的时间轴。
     对英文做逐词高亮尚可，但中文短视频字幕如果直接照搬，会出现
-    “金钱 / 是 / 一种 / 社会 / 工具” 这种阅读体验很差的效果。
+    "金钱 / 是 / 一种 / 社会 / 工具" 这种阅读体验很差的效果。
 
     实现策略：
     1. 逐个消费 cues 中的 `content`；
@@ -1603,14 +1628,16 @@ def _build_subtitle_items_from_edge_cues(
         current_end_time = int(cue.end.total_seconds() * 10000000)
         current_text += cue_text
 
-        matched_text = _match_script_line(script_lines, current_text, sub_index)
+        matched_text, lines_consumed = _match_script_line(
+            script_lines, current_text, sub_index
+        )
         if not matched_text:
             continue
 
-        sub_index += 1
+        sub_index += lines_consumed
         sub_items.append(
             formatter(
-                idx=sub_index,
+                idx=len(sub_items) + 1,
                 start_time=current_start_time,
                 end_time=current_end_time,
                 sub_text=matched_text,
@@ -1624,12 +1651,12 @@ def _build_subtitle_items_from_edge_cues(
             f"edge cues still have unmatched text after aggregation: {current_text}"
         )
 
-    return sub_items
+    return sub_items, sub_index
 
 
 def _build_subtitle_items_from_legacy_submaker(
     sub_maker: SubMaker, script_lines: list[str]
-) -> list[str]:
+) -> Tuple[list[str], int]:
     """
     将项目原有 `subs/offset` 结构聚合为按脚本断句的 SRT 片段。
 
@@ -1650,14 +1677,16 @@ def _build_subtitle_items_from_legacy_submaker(
             start_time = current_start_time
 
         sub_line += unescape(sub)
-        matched_text = _match_script_line(script_lines, sub_line, sub_index)
+        matched_text, lines_consumed = _match_script_line(
+            script_lines, sub_line, sub_index
+        )
         if not matched_text:
             continue
 
-        sub_index += 1
+        sub_index += lines_consumed
         sub_items.append(
             formatter(
-                idx=sub_index,
+                idx=len(sub_items) + 1,
                 start_time=start_time,
                 end_time=current_end_time,
                 sub_text=matched_text,
@@ -1671,6 +1700,80 @@ def _build_subtitle_items_from_legacy_submaker(
             f"legacy subtitle items still have unmatched text after aggregation: {sub_line}"
         )
 
+    return sub_items, sub_index
+
+
+def _parse_last_subtitle_end_time(sub_items: list[str]) -> int:
+    """
+    从已生成的 SRT 片段列表中解析最后一条字幕的结束时间。
+
+    每个片段的第一行是序号，第二行是 "00:00:00,000 --> 00:00:00,000"，
+    这里用正则提取结束时间戳并转换为 100 纳秒单位（与 edge_tts 兼容）。
+    """
+    last_item = sub_items[-1]
+    # SRT 行格式：idx \n start --> end \n text
+    lines = last_item.strip().split("\n")
+    if len(lines) >= 2:
+        time_parts = lines[1].split(" --> ")
+        if len(time_parts) >= 2:
+            end_str = time_parts[1].strip().replace(",", ".")
+            h, m, s = end_str.split(":")
+            seconds = int(h) * 3600 + int(m) * 60 + float(s)
+            return int(seconds * 10_000_000)
+    return 0
+
+
+def _fill_remaining_script_lines(
+    sub_items: list[str],
+    script_lines: list[str],
+    sub_index: int,
+    last_end_time_100ns: int,
+    audio_duration_100ns: int,
+    formatter,
+) -> list[str]:
+    """
+    将未被 TTS 词边界覆盖的剩余脚本行，均摊到音频末尾的时间段中。
+
+    当脚本存在大量短行（如"考研？""考公？""找工作？"）时，Edge TTS
+    可能将其合并成一条连续语音，导致词边界数量远少于脚本行数。旧逻辑会
+    直接丢弃整个字幕文件；现在改为为剩余行估算时间轴，保证视频至少
+    有字幕可读，而不是完全缺失。
+    """
+    remaining_lines = script_lines[sub_index:]
+    if not remaining_lines:
+        return sub_items
+
+    gap_100ns = max(0, audio_duration_100ns - last_end_time_100ns)
+    # 给剩余行留一个最小可读窗口，避免它们在音频末尾被压缩成 0 秒字幕。
+    min_gap_per_line = int(0.8 * 10_000_000)  # 0.8 秒，100ns 单位
+    needed_gap = min_gap_per_line * len(remaining_lines)
+    if gap_100ns < needed_gap:
+        # 在音频之后追加一段虚拟时间轴，确保每行都有足够阅读时间。
+        gap_100ns = needed_gap
+        logger.debug(
+            "subtitle audio gap too small for remaining lines, "
+            f"extending timeline by {needed_gap - (audio_duration_100ns - last_end_time_100ns)} 100ns units"
+        )
+
+    segment_duration = max(1, gap_100ns // len(remaining_lines))
+    logger.warning(
+        f"filling remaining subtitle lines with estimated timestamps, "
+        f"matched: {sub_index}, total: {len(script_lines)}, "
+        f"gap: {gap_100ns / 10_000_000:.2f}s"
+    )
+
+    for i, line in enumerate(remaining_lines):
+        line_start = last_end_time_100ns + i * segment_duration
+        line_end = line_start + segment_duration
+        sub_items.append(
+            formatter(
+                idx=len(sub_items) + 1,
+                start_time=line_start,
+                end_time=line_end,
+                sub_text=line.strip(),
+            )
+        )
+
     return sub_items
 
 
@@ -1680,22 +1783,43 @@ def create_subtitle(sub_maker: SubMaker, text: str, subtitle_file: str):
     1. 将字幕文件按照标点符号分割成多行
     2. 逐行匹配字幕文件中的文本
     3. 生成新的字幕文件
+
+    即使部分脚本行无法和 TTS 词边界精确匹配，也会继续输出字幕文件，
+    并通过估算时间轴保证剩余行可见，避免整条视频完全没有字幕。
     """
     text = _format_text(text)
     script_lines = utils.split_string_by_punctuations(text)
+    audio_duration_100ns = int(_get_audio_duration_from_submaker(sub_maker) * 10_000_000)
+    formatter = _build_subtitle_formatter()
+
     try:
         if hasattr(sub_maker, "cues") and sub_maker.cues:
-            sub_items = _build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+            sub_items, matched_count = _build_subtitle_items_from_edge_cues(
+                sub_maker, script_lines
+            )
         else:
-            sub_items = _build_subtitle_items_from_legacy_submaker(
+            sub_items, matched_count = _build_subtitle_items_from_legacy_submaker(
                 sub_maker, script_lines
             )
 
-        if len(sub_items) != len(script_lines):
-            logger.warning(
-                f"failed, sub_items len: {len(sub_items)}, script_lines len: {len(script_lines)}"
+        if matched_count < len(script_lines):
+            # 从已匹配的最后一条字幕中提取结束时间；如果没有匹配到
+            # 任何行，则从音频开头开始分配剩余行的时间轴。
+            last_end_100ns = 0
+            if sub_items:
+                try:
+                    last_end_100ns = _parse_last_subtitle_end_time(sub_items)
+                except Exception:
+                    last_end_100ns = 0
+
+            sub_items = _fill_remaining_script_lines(
+                sub_items=sub_items,
+                script_lines=script_lines,
+                sub_index=matched_count,
+                last_end_time_100ns=last_end_100ns,
+                audio_duration_100ns=max(audio_duration_100ns, last_end_100ns),
+                formatter=formatter,
             )
-            return
 
         _write_subtitle_items(sub_items, subtitle_file)
     except Exception as e:
@@ -1768,7 +1892,7 @@ if __name__ == "__main__":
             "zh-CN-YunxiNeural",
         ]
         text = """
-        静夜思是唐代诗人李白创作的一首五言古诗。这首诗描绘了诗人在寂静的夜晚，看到窗前的明月，不禁想起远方的家乡和亲人，表达了他对家乡和亲人的深深思念之情。全诗内容是：“床前明月光，疑是地上霜。举头望明月，低头思故乡。”在这短短的四句诗中，诗人通过“明月”和“思故乡”的意象，巧妙地表达了离乡背井人的孤独与哀愁。首句“床前明月光”设景立意，通过明亮的月光引出诗人的遐想；“疑是地上霜”增添了夜晚的寒冷感，加深了诗人的孤寂之情；“举头望明月”和“低头思故乡”则是情感的升华，展现了诗人内心深处的乡愁和对家的渴望。这首诗简洁明快，情感真挚，是中国古典诗歌中非常著名的一首，也深受后人喜爱和推崇。
+        静夜思是唐代诗人李白创作的一首五言古诗。这首诗描绘了诗人在寂静的夜晚，看到窗前的明月，不禁想起远方的家乡和亲人，表达了他对家乡和亲人的深深思念之情。全诗内容是："床前明月光，疑是地上霜。举头望明月，低头思故乡。"在这短短的四句诗中，诗人通过"明月"和"思故乡"的意象，巧妙地表达了离乡背井人的孤独与哀愁。首句"床前明月光"设景立意，通过明亮的月光引出诗人的遐想；"疑是地上霜"增添了夜晚的寒冷感，加深了诗人的孤寂之情；"举头望明月"和"低头思故乡"则是情感的升华，展现了诗人内心深处的乡愁和对家的渴望。这首诗简洁明快，情感真挚，是中国古典诗歌中非常著名的一首，也深受后人喜爱和推崇。
             """
 
         text = """
