@@ -250,7 +250,7 @@ def generate_terms(task_id, params, video_script):
     if not video_terms:
         # 开启素材按文案顺序匹配后，关键词本身也必须按脚本叙事顺序生成；
         # 否则后续即使顺序下载和顺序拼接，也只能复用一组全局主题词，
-        # 无法改善"后面内容的画面提前出现"的问题。
+        # 无法改善“后面内容的画面提前出现”的问题。
         video_terms = llm.generate_terms(
             video_subject=params.video_subject,
             video_script=video_script,
@@ -275,15 +275,9 @@ def generate_terms(task_id, params, video_script):
         )
         return None
 
-    # 逐句关键词模式下，顺序本身就是按脚本叙事排列的，跳过语义重排；
-    # 同时也不应打乱素材顺序，后续拼接自动使用 sequential 模式。
-    # TwelveLabs Marengo 重排仅适用于全局关键词模式。
-    _is_per_sentence = (
-        isinstance(video_terms, list)
-        and video_terms
-        and isinstance(video_terms[0], dict)
-    )
-    if not _is_per_sentence and not params.match_materials_to_script:
+    # 可选的 TwelveLabs Marengo 语义重排：未启用时返回原顺序，无任何副作用。
+    # 顺序匹配模式下关键词顺序本身就是脚本叙事顺序，必须保持原样，故跳过。
+    if not params.match_materials_to_script:
         video_terms = twelvelabs.rerank_terms_by_subject(
             video_subject=params.video_subject,
             search_terms=video_terms,
@@ -461,9 +455,7 @@ def generate_subtitle(task_id, params, video_script, sub_maker, audio_file):
     return subtitle_path
 
 
-def get_video_materials(
-    task_id, params, video_terms, audio_duration, sentence_durations=None
-):
+def get_video_materials(task_id, params, video_terms, audio_duration):
     if params.video_source == "local":
         logger.info("\n\n## preprocess local materials")
         materials = video.preprocess_video(
@@ -479,42 +471,22 @@ def get_video_materials(
         return [material_info.url for material_info in materials]
     else:
         logger.info(f"\n\n## downloading videos from {params.video_source}")
-        # 检测是否为逐句关键词模式
-        _is_per_sentence = (
-            isinstance(video_terms, list)
-            and video_terms
-            and isinstance(video_terms[0], dict)
-        )
-        _use_sequential = params.match_materials_to_script or _is_per_sentence
-        result = material.download_videos(
+        # 顺序匹配模式只在用户显式开启时生效。这里强制素材下载按关键词顺序
+        # 轮询，避免某个早期关键词下载太多素材，把后续脚本主题挤出最终时间线。
+        downloaded_videos = material.download_videos(
             task_id=task_id,
             search_terms=video_terms,
             source=params.video_source,
             video_aspect=params.video_aspect,
             video_concat_mode=(
                 VideoConcatMode.sequential
-                if _use_sequential
+                if params.match_materials_to_script
                 else params.video_concat_mode
             ),
             audio_duration=audio_duration * params.video_count,
             max_clip_duration=params.video_clip_duration,
-            match_script_order=_use_sequential,
-            sentence_durations=sentence_durations,
+            match_script_order=params.match_materials_to_script,
         )
-        # 逐句模式返回 (flat_paths, sentence_groups) 元组
-        if _is_per_sentence and isinstance(result, tuple):
-            downloaded_videos, sentence_groups = result
-            if not downloaded_videos:
-                _mark_task_failed(
-                    task_id,
-                    "materials",
-                    f"failed to download video materials from {params.video_source}",
-                )
-                return None
-            # 将分组信息附加到返回值中供 generate_final_videos 使用
-            return {"paths": downloaded_videos, "sentence_groups": sentence_groups}
-
-        downloaded_videos = result
         if not downloaded_videos:
             _mark_task_failed(
                 task_id,
@@ -525,62 +497,17 @@ def get_video_materials(
         return downloaded_videos
 
 
-def _build_sentence_segments(
-    sentence_groups: list[list[str]],
-    sentence_timings: list[dict],
-) -> list[dict]:
-    """
-    将逐句素材分组和 TTS 时间轴组装为分段时间信息。
-
-    返回: [
-      {"videos": [path, ...], "duration": 2.3, "sentence": "..."},
-      ...
-    ]
-    """
-    segments = []
-    for i, (groups, timing) in enumerate(
-        zip(sentence_groups, sentence_timings)
-    ):
-        duration = max(0.1, timing.get("end", 0) - timing.get("start", 0))
-        segments.append(
-            {
-                "videos": groups if groups else [],
-                "duration": duration,
-                "sentence": timing.get("sentence", ""),
-            }
-        )
-    # 如果时间轴行数多于素材分组（边缘情况），补齐空素材
-    if len(sentence_timings) > len(sentence_groups):
-        for timing in sentence_timings[len(sentence_groups):]:
-            duration = max(0.1, timing.get("end", 0) - timing.get("start", 0))
-            segments.append(
-                {"videos": [], "duration": duration, "sentence": timing.get("sentence", "")}
-            )
-    return segments
-
-
 def generate_final_videos(
-    task_id,
-    params,
-    downloaded_videos,
-    audio_file,
-    subtitle_path,
-    audio_duration,
-    sentence_timings=None,
+    task_id, params, downloaded_videos, audio_file, subtitle_path, audio_duration
 ):
     final_video_paths = []
     combined_video_paths = []
     warnings = []
-    # 逐句模式：从 downloaded_videos 中提取分组信息和时间轴
-    sentence_groups = None
-    if isinstance(downloaded_videos, dict):
-        sentence_groups = downloaded_videos.get("sentence_groups")
-        downloaded_videos = downloaded_videos.get("paths", [])
     sonilo_bgm_requested = (
         params.bgm_type == "sonilo"
         and bgm_service.should_use_bgm(params.bgm_type, params.bgm_volume)
     )
-    # 多视频生成默认会打散素材以增加差异；但"按文案顺序匹配素材"追求的是
+    # 多视频生成默认会打散素材以增加差异；但“按文案顺序匹配素材”追求的是
     # 时间线稳定性和可解释性，所以开启后所有输出都使用顺序拼接。
     if params.match_materials_to_script:
         video_concat_mode = VideoConcatMode.sequential
@@ -597,16 +524,6 @@ def generate_final_videos(
             utils.task_dir(task_id), f"combined-{index}.mp4"
         )
         logger.info(f"\n\n## combining video: {index} => {combined_video_path}")
-        # 逐句模式：构建精确时长的分段时间信息
-        _segments = None
-        if sentence_groups and sentence_timings:
-            _segments = _build_sentence_segments(
-                sentence_groups, sentence_timings
-            )
-            logger.info(
-                f"using sentence-level segments: {len(_segments)} segments, "
-                f"total duration: {sum(s.get('duration', 0) for s in _segments):.1f}s"
-            )
         video.combine_videos(
             combined_video_path=combined_video_path,
             video_paths=downloaded_videos,
@@ -617,7 +534,6 @@ def generate_final_videos(
             max_clip_duration=params.video_clip_duration,
             threads=params.n_threads,
             clip_speed=params.video_clip_speed,
-            sentence_segments=_segments,
         )
 
         _progress += 50 / params.video_count / 2
@@ -1093,31 +1009,6 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
         task_id, params, video_script, sub_maker, audio_file
     )
 
-    # 逐句模式下，从 TTS 数据中提取每句话的朗读时间轴
-    _is_per_sentence = (
-        isinstance(video_terms, list)
-        and video_terms
-        and isinstance(video_terms[0], dict)
-    )
-    sentence_timings = None
-    sentence_durations = None
-    if _is_per_sentence and sub_maker is not None:
-        try:
-            sentence_timings = voice.get_sentence_timings(
-                sub_maker, video_script
-            )
-            sentence_durations = [
-                max(0.1, t["end"] - t["start"]) for t in sentence_timings
-            ]
-            logger.info(
-                f"extracted {len(sentence_durations)} sentence durations "
-                f"from TTS for per-sentence matching"
-            )
-        except Exception as exc:
-            logger.warning(f"failed to extract sentence timings: {exc}")
-            sentence_timings = None
-            sentence_durations = None
-
     if stop_at == "subtitle":
         sm.state.update_task(
             task_id,
@@ -1131,7 +1022,7 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
 
     # 5. Get video materials
     downloaded_videos = get_video_materials(
-        task_id, params, video_terms, audio_duration, sentence_durations
+        task_id, params, video_terms, audio_duration
     )
     if not downloaded_videos:
         return _mark_task_failed(
@@ -1156,16 +1047,6 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
     if type(params.video_concat_mode) is str:
         params.video_concat_mode = VideoConcatMode(params.video_concat_mode)
 
-    # 逐句关键词模式下，素材已按脚本句子顺序下载排列，必须使用顺序拼接
-    # 以保证第1句的素材出现在视频开头，第2句紧随其后，画面与文案自然对齐。
-    _is_per_sentence = (
-        isinstance(video_terms, list)
-        and video_terms
-        and isinstance(video_terms[0], dict)
-    )
-    if _is_per_sentence:
-        params.match_materials_to_script = True
-
     # 6. Generate final videos
     final_video_paths, combined_video_paths, generation_warnings = generate_final_videos(
         task_id,
@@ -1174,7 +1055,6 @@ def _run_pipeline(task_id, params: VideoParams, stop_at: str = "video"):
         audio_file,
         subtitle_path,
         audio_duration,
-        sentence_timings=sentence_timings,
     )
 
     if not final_video_paths:

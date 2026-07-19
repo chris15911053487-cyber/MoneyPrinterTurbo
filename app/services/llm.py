@@ -587,22 +587,34 @@ def generate_terms(
     video_script: str,
     amount: int = 5,
     match_script_order: bool = False,
-) -> List[str] | List[dict]:
-    if match_script_order:
-        return _generate_terms_per_sentence(video_subject, video_script)
-    return _generate_terms_global(video_subject, video_script, amount)
-
-
-def _generate_terms_global(
-    video_subject: str,
-    video_script: str,
-    amount: int,
 ) -> List[str]:
-    goal = (
-        f"Generate {amount} search terms for stock videos, depending on the "
-        "subject of a video."
-    )
-    output_example = '["中文关键词 English keywords", "term2", "term3", "term4", "term5"]'
+    if match_script_order:
+        goal = (
+            f"Generate {amount} chronological stock-video search terms that follow "
+            "the order of topics in the video script."
+        )
+        ordering_rule = (
+            "6. keep the terms in the same order as the script narration; "
+            "earlier terms must describe earlier visual moments."
+        )
+        # 有序关键词模式下，示例数量要和 amount 保持一致，避免模型被固定
+        # 的 4 个示例误导，导致长文案只返回少量关键词，影响素材覆盖度。
+        example_terms = [
+            "opening visual topic",
+            *[f"script visual topic {index}" for index in range(2, max(amount, 1))],
+            "final visual topic",
+        ]
+        output_example = json.dumps(example_terms[:amount], ensure_ascii=False)
+    else:
+        goal = (
+            f"Generate {amount} search terms for stock videos, depending on the "
+            "subject of a video."
+        )
+        ordering_rule = ""
+        output_example = (
+            '["search term 1", "search term 2", "search term 3",'
+            '"search term 4", "search term 5"]'
+        )
 
     prompt = f"""
 # Role: Video Search Terms Generator
@@ -612,12 +624,11 @@ def _generate_terms_global(
 
 ## Constrains:
 1. the search terms are to be returned as a json-array of strings.
-2. each search term should consist of 2-5 words, combining Chinese AND English
-   (e.g. "毕业季 graduation season", "职场办公 office workplace").
-   Chinese helps find region-specific scenes; English ensures broader coverage.
+2. each search term should consist of 1-3 words, always add the main subject of the video.
 3. you must only return the json-array of strings. you must not return anything else. you must not return the script.
 4. the search terms must be related to the subject of the video.
-5. always add the main subject of the video in each search term.
+5. reply with english search terms only.
+{ordering_rule}
 
 ## Output Example:
 {output_example}
@@ -628,267 +639,30 @@ def _generate_terms_global(
 
 ### Video Script
 {video_script}
+
+Please note that you must use English for generating video search terms; Chinese is not accepted.
 """.strip()
 
-    logger.info(f"subject: {video_subject}")
+    logger.info(f"subject: {video_subject}, match_script_order: {match_script_order}")
 
-    return _parse_and_retry_terms(prompt, expect_strings=True)
-
-
-def _generate_terms_per_sentence(
-    video_subject: str,
-    video_script: str,
-) -> List[dict]:
-    """
-    为脚本生成按叙事顺序排列的关键词组。
-
-    先按标点断句，再将相邻短句合并为语义组（最多 15 组），每组生成
-    2-3 个中英双语搜索关键词。这样既保证关键词覆盖脚本的叙事推进，
-    又避免为 60+ 个短句各生成一套关键词导致数量爆炸。
-    """
-    from app.utils import utils as app_utils
-
-    script_lines = app_utils.split_string_by_punctuations(video_script)
-    if not script_lines:
-        return []
-
-    # 将相邻短句合并为语义段落，控制总组数在合理范围
-    _TARGET_GROUP_COUNT = 6
-    _MAX_GROUP_COUNT = 8
-    merged_groups = _merge_short_sentences(
-        script_lines, target=_TARGET_GROUP_COUNT, max_groups=_MAX_GROUP_COUNT
-    )
-
-    # 构建带编号的句子组给 LLM
-    numbered_lines = "\n".join(
-        f"{i + 1}. {group}" for i, group in enumerate(merged_groups)
-    )
-
-    prompt = f"""
-# Role: Video Search Terms Generator
-
-## Goals:
-Below is a video script divided into {len(merged_groups)} visual segments (each
-may contain 1 or more short sentences). For EACH segment, generate 1-2 bilingual
-(Chinese + English) stock-video search keywords that best match the visual
-theme of that segment.
-
-## Constrains:
-1. return ONLY a JSON array with exactly {len(merged_groups)} items, nothing else.
-2. each item is an array of 1-2 strings: the keywords for segment N.
-3. each keyword should combine Chinese AND English, e.g.
-   "毕业季 graduation season" or "大学校园 university campus".
-   Chinese describes the scene, English ensures broader coverage.
-4. keywords must visually describe what could appear on screen: people,
-   places, actions, objects, moods.
-
-## Output Format (JSON array of arrays):
-[
-  ["keyword1 CN EN", "keyword2 CN EN"],
-  ...
-]
-
-## Script Segments:
-{numbered_lines}
-
-## Video Subject:
-{video_subject}
-""".strip()
-
-    logger.info(
-        f"subject: {video_subject}, mode: per-sentence, "
-        f"lines: {len(script_lines)}, groups: {len(merged_groups)}"
-    )
-
-    keyword_lists = _parse_and_retry_terms_per_sentence(prompt, len(merged_groups))
-    if not keyword_lists:
-        return []
-
-    # 展开为与原始句子对齐的结果（兼容后续时间轴匹配）
-    result = []
-    group_idx = 0
-    for group_text in merged_groups:
-        keywords = keyword_lists[group_idx] if group_idx < len(keyword_lists) else []
-        if not keywords:
-            keywords = _fallback_keywords(video_subject, group_text)
-        # 将合并组拆回原始句子，每句共享同一套关键词
-        sub_lines = app_utils.split_string_by_punctuations(group_text)
-        for line in sub_lines:
-            result.append({"sentence": line, "keywords": keywords})
-        group_idx += 1
-    return result
-
-
-def _merge_short_sentences(
-    lines: list[str], target: int = 12, max_groups: int = 15
-) -> list[str]:
-    """
-    将短句子合并为语义段落，控制总组数在 target 附近，不超过 max_groups。
-
-    策略：从左到右累积，直到当前组的总字数达到阈值后再开新组。
-    这样可以避免 60+ 行短句各成一组，也不会把长句无意义地拼在一起。
-    """
-    if len(lines) <= max_groups:
-        return lines
-
-    total_chars = sum(len(line) for line in lines)
-    # 按 target 组数估算每组的目标字数
-    chars_per_group = max(8, total_chars // target)
-    groups = []
-    current = ""
-    for line in lines:
-        candidate = f"{current}{line}" if current else line
-        if current and len(candidate) > chars_per_group:
-            groups.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        groups.append(current)
-
-    # 如果合并后还是太多，进一步提高合并力度
-    if len(groups) > max_groups:
-        return _merge_short_sentences(
-            groups, target=target - 2, max_groups=max_groups
-        )
-
-    logger.debug(
-        f"merged {len(lines)} sentences into {len(groups)} groups "
-        f"(target={target}, max={max_groups})"
-    )
-    return groups
-
-    # 逐句模式返回 List[list[str]]，外层列表长度 = script_lines 长度
-    keyword_lists = _parse_and_retry_terms_per_sentence(prompt, len(script_lines))
-    if not keyword_lists:
-        return []
-
-    # 包装为统一格式
-    result = []
-    for i, line in enumerate(script_lines):
-        keywords = keyword_lists[i] if i < len(keyword_lists) else []
-        if not keywords:
-            keywords = _fallback_keywords(video_subject, line)
-        result.append({"sentence": line, "keywords": keywords})
-    return result
-
-
-def _fallback_keywords(video_subject: str, sentence: str) -> list[str]:
-    """LLM 未返回某句关键词时的兜底：用视频主题构造一个基本搜索词。"""
-    subject = str(video_subject or "").strip()
-    sent = str(sentence or "").strip()
-    if subject and sent:
-        return [f"{subject} {sent}"]
-    if subject:
-        return [subject]
-    return [sent] if sent else ["video background"]
-
-
-def _parse_and_retry_terms_per_sentence(
-    prompt: str, expected_count: int
-) -> list[list[str]] | None:
-    """
-    解析 LLM 返回的逐句关键词，格式为 List[List[str]]。
-
-    外层列表长度应等于 expected_count（脚本断句行数）。
-    不匹配时重试；多次失败后返回 None，由调用方用兜底关键词填充。
-    """
+    search_terms = []
     response = ""
     for i in range(_max_retries):
         try:
             response = _generate_response(prompt)
             if response.startswith("Error: "):
-                logger.error(f"failed to generate per-sentence terms: {response}")
-                return None
-            parsed = json.loads(_strip_code_fence(response))
-            if not isinstance(parsed, list) or len(parsed) == 0:
-                logger.error("response is not a non-empty list")
-                continue
-            if all(isinstance(item, list) for item in parsed):
-                if len(parsed) != expected_count:
-                    logger.warning(
-                        f"keyword count mismatch: got {len(parsed)}, "
-                        f"expected {expected_count}, retrying..."
-                    )
-                    continue
-                logger.success(f"per-sentence terms: {len(parsed)} lines")
-                return parsed
-            # 旧格式兼容：[{"sentence": ..., "keywords": [...]}, ...]
-            if all(isinstance(item, dict) for item in parsed):
-                logger.warning(
-                    "LLM returned old per-sentence format, extracting keywords"
-                )
-                result = [item.get("keywords", []) for item in parsed]
-                if len(result) != expected_count:
-                    continue
-                return result
-            logger.error("response is not a list of keyword arrays")
-            continue
-        except Exception as e:
-            logger.warning(f"failed to generate per-sentence terms: {str(e)}")
-            if response:
-                match = re.search(r"\[.*]", response, re.DOTALL)
-                if match:
-                    try:
-                        parsed = json.loads(match.group())
-                        if (
-                            isinstance(parsed, list)
-                            and len(parsed) == expected_count
-                            and all(isinstance(item, list) for item in parsed)
-                        ):
-                            return parsed
-                    except Exception:
-                        pass
-        if i < _max_retries:
-            logger.warning(
-                f"failed to generate per-sentence terms, retrying... {i + 1}"
-            )
-    return None
-
-
-def _parse_and_retry_terms(prompt: str, expect_strings: bool):
-    """
-    解析 LLM 返回的关键词列表，支持重试和格式回退。
-
-    expect_strings=True  → 期望 List[str]，用于全局关键词模式
-    expect_strings=False → 期望 List[dict]，用于逐句关键词模式
-    """
-    response = ""
-    for i in range(_max_retries):
-        try:
-            response = _generate_response(prompt)
-            if response.startswith("Error: "):
+                # generate_terms 的公开返回类型是 List[str]。如果把 Provider 的
+                # 错误文案原样返回，下游只做空值判断时会把非空字符串误认为成功，
+                # 素材下载循环还会按字符遍历错误文案，产生无意义的外部请求。
+                # 这里统一返回空列表，让任务编排层在真实故障位置立即结束任务。
                 logger.error(f"failed to generate video terms: {response}")
                 return []
-            parsed = json.loads(_strip_code_fence(response))
-            if not isinstance(parsed, list) or len(parsed) == 0:
-                logger.error("response is not a non-empty list.")
+            search_terms = json.loads(_strip_code_fence(response))
+            if not isinstance(search_terms, list) or not all(
+                isinstance(term, str) for term in search_terms
+            ):
+                logger.error("response is not a list of strings.")
                 continue
-
-            if expect_strings:
-                if not all(isinstance(item, str) for item in parsed):
-                    logger.error("response is not a list of strings.")
-                    continue
-            else:
-                # 逐句模式：期望 [{"sentence": ..., "keywords": [...]}, ...]
-                if all(isinstance(item, dict) and "sentence" in item and "keywords" in item
-                       for item in parsed):
-                    logger.success(
-                        f"completed per-sentence terms: {len(parsed)} sentences"
-                    )
-                    return parsed
-                # 如果 LLM 返回了旧的字符串格式，尝试转换为新格式
-                if all(isinstance(item, str) for item in parsed):
-                    logger.warning(
-                        "LLM returned string list instead of per-sentence objects, "
-                        "falling back to global keyword mode"
-                    )
-                    return [{"sentence": "", "keywords": parsed}]
-                logger.error("response is not a list of sentence-keyword objects.")
-                continue
-
-            logger.success(f"completed: \n{parsed}")
-            return parsed
 
         except Exception as e:
             logger.warning(f"failed to generate video terms: {str(e)}")
@@ -896,23 +670,20 @@ def _parse_and_retry_terms(prompt: str, expect_strings: bool):
                 match = re.search(r"\[.*]", response, re.DOTALL)
                 if match:
                     try:
-                        parsed = json.loads(match.group())
-                        if isinstance(parsed, list) and len(parsed) > 0:
-                            if expect_strings:
-                                if all(isinstance(item, str) for item in parsed):
-                                    return parsed
-                            elif all(isinstance(item, dict) for item in parsed):
-                                return parsed
-                    except Exception as parse_error:
-                        logger.warning(
-                            f"failed to parse video terms from regex match: {str(parse_error)}"
-                        )
+                        search_terms = json.loads(match.group())
+                    except Exception as e:
+                        # 这里保留重试流程，但必须记录 LLM 返回的非标准 JSON，
+                        # 否则后续排查搜索词为空时无法定位
+                        # 是模型格式问题还是解析逻辑问题。
+                        logger.warning(f"failed to generate video terms: {str(e)}")
 
+        if search_terms and len(search_terms) > 0:
+            break
         if i < _max_retries:
             logger.warning(f"failed to generate video terms, trying again... {i + 1}")
 
-    logger.error("failed to generate video terms after all retries")
-    return []
+    logger.success(f"completed: \n{search_terms}")
+    return search_terms
 
 
 # =============================================================================
