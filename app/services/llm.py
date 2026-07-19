@@ -640,51 +640,55 @@ def _generate_terms_per_sentence(
     video_script: str,
 ) -> List[dict]:
     """
-    为脚本中的每一句话（按标点断句）生成中英双语搜索关键词。
+    为脚本生成按叙事顺序排列的关键词组。
 
-    使用与字幕/TTS 时间轴相同的断句方式，确保关键词数量和时间轴一一对应。
-    每行都会有关键词（包括短句），LLM 无法跳行。
+    先按标点断句，再将相邻短句合并为语义组（最多 15 组），每组生成
+    2-3 个中英双语搜索关键词。这样既保证关键词覆盖脚本的叙事推进，
+    又避免为 60+ 个短句各生成一套关键词导致数量爆炸。
     """
-    # 使用与字幕匹配相同的断句逻辑，保证行数对齐
     from app.utils import utils as app_utils
 
     script_lines = app_utils.split_string_by_punctuations(video_script)
     if not script_lines:
         return []
 
-    # 构建带编号的句子列表给 LLM
+    # 将相邻短句合并为语义段落，控制总组数在合理范围
+    _TARGET_GROUP_COUNT = 12
+    _MAX_GROUP_COUNT = 15
+    merged_groups = _merge_short_sentences(
+        script_lines, target=_TARGET_GROUP_COUNT, max_groups=_MAX_GROUP_COUNT
+    )
+
+    # 构建带编号的句子组给 LLM
     numbered_lines = "\n".join(
-        f"{i + 1}. {line}" for i, line in enumerate(script_lines)
+        f"{i + 1}. {group}" for i, group in enumerate(merged_groups)
     )
 
     prompt = f"""
 # Role: Video Search Terms Generator
 
 ## Goals:
-Below is a video script split into {len(script_lines)} sentences (numbered).
-For EVERY sentence, generate 2-3 bilingual (Chinese + English) stock-video
-search keywords that best match the visual meaning of that sentence.
+Below is a video script divided into {len(merged_groups)} visual segments (each
+may contain 1 or more short sentences). For EACH segment, generate 2 bilingual
+(Chinese + English) stock-video search keywords that best match the visual
+theme of that segment.
 
 ## Constrains:
-1. return ONLY a JSON array with exactly {len(script_lines)} items, nothing else.
-2. each item is an array of 2-3 strings: the keywords for sentence N.
-   The position in the outer array corresponds to the sentence number.
+1. return ONLY a JSON array with exactly {len(merged_groups)} items, nothing else.
+2. each item is an array of 2 strings: the keywords for segment N.
 3. each keyword should combine Chinese AND English, e.g.
    "毕业季 graduation season" or "大学校园 university campus".
    Chinese describes the scene, English ensures broader coverage.
 4. keywords must visually describe what could appear on screen: people,
    places, actions, objects, moods.
-5. for short sentences with no clear visual (e.g. "考研？"), use the
-   nearest visually meaningful neighbor's theme.
 
 ## Output Format (JSON array of arrays):
 [
   ["keyword1 CN EN", "keyword2 CN EN"],
-  ["keyword1 CN EN", "keyword2 CN EN"],
   ...
 ]
 
-## Script Sentences:
+## Script Segments:
 {numbered_lines}
 
 ## Video Subject:
@@ -692,8 +696,67 @@ search keywords that best match the visual meaning of that sentence.
 """.strip()
 
     logger.info(
-        f"subject: {video_subject}, mode: per-sentence, lines: {len(script_lines)}"
+        f"subject: {video_subject}, mode: per-sentence, "
+        f"lines: {len(script_lines)}, groups: {len(merged_groups)}"
     )
+
+    keyword_lists = _parse_and_retry_terms_per_sentence(prompt, len(merged_groups))
+    if not keyword_lists:
+        return []
+
+    # 展开为与原始句子对齐的结果（兼容后续时间轴匹配）
+    result = []
+    group_idx = 0
+    for group_text in merged_groups:
+        keywords = keyword_lists[group_idx] if group_idx < len(keyword_lists) else []
+        if not keywords:
+            keywords = _fallback_keywords(video_subject, group_text)
+        # 将合并组拆回原始句子，每句共享同一套关键词
+        sub_lines = app_utils.split_string_by_punctuations(group_text)
+        for line in sub_lines:
+            result.append({"sentence": line, "keywords": keywords})
+        group_idx += 1
+    return result
+
+
+def _merge_short_sentences(
+    lines: list[str], target: int = 12, max_groups: int = 15
+) -> list[str]:
+    """
+    将短句子合并为语义段落，控制总组数在 target 附近，不超过 max_groups。
+
+    策略：从左到右累积，直到当前组的总字数达到阈值后再开新组。
+    这样可以避免 60+ 行短句各成一组，也不会把长句无意义地拼在一起。
+    """
+    if len(lines) <= max_groups:
+        return lines
+
+    total_chars = sum(len(line) for line in lines)
+    # 按 target 组数估算每组的目标字数
+    chars_per_group = max(8, total_chars // target)
+    groups = []
+    current = ""
+    for line in lines:
+        candidate = f"{current}{line}" if current else line
+        if current and len(candidate) > chars_per_group:
+            groups.append(current)
+            current = line
+        else:
+            current = candidate
+    if current:
+        groups.append(current)
+
+    # 如果合并后还是太多，进一步提高合并力度
+    if len(groups) > max_groups:
+        return _merge_short_sentences(
+            groups, target=target - 2, max_groups=max_groups
+        )
+
+    logger.debug(
+        f"merged {len(lines)} sentences into {len(groups)} groups "
+        f"(target={target}, max={max_groups})"
+    )
+    return groups
 
     # 逐句模式返回 List[list[str]]，外层列表长度 = script_lines 长度
     keyword_lists = _parse_and_retry_terms_per_sentence(prompt, len(script_lines))
