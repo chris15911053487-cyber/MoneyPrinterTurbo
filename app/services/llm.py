@@ -653,8 +653,8 @@ def _generate_terms_per_sentence(
         return []
 
     # 将相邻短句合并为语义段落，控制总组数在合理范围
-    _TARGET_GROUP_COUNT = 12
-    _MAX_GROUP_COUNT = 15
+    _TARGET_GROUP_COUNT = 6
+    _MAX_GROUP_COUNT = 8
     merged_groups = _merge_short_sentences(
         script_lines, target=_TARGET_GROUP_COUNT, max_groups=_MAX_GROUP_COUNT
     )
@@ -669,13 +669,13 @@ def _generate_terms_per_sentence(
 
 ## Goals:
 Below is a video script divided into {len(merged_groups)} visual segments (each
-may contain 1 or more short sentences). For EACH segment, generate 2 bilingual
+may contain 1 or more short sentences). For EACH segment, generate 1-2 bilingual
 (Chinese + English) stock-video search keywords that best match the visual
 theme of that segment.
 
 ## Constrains:
 1. return ONLY a JSON array with exactly {len(merged_groups)} items, nothing else.
-2. each item is an array of 2 strings: the keywords for segment N.
+2. each item is an array of 1-2 strings: the keywords for segment N.
 3. each keyword should combine Chinese AND English, e.g.
    "毕业季 graduation season" or "大学校园 university campus".
    Chinese describes the scene, English ensures broader coverage.
